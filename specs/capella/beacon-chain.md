@@ -157,7 +157,11 @@ class ExecutionPayload(Container):
     # Extra payload fields
     block_hash: Hash32  # Hash of execution block
     transactions: List[Transaction, MAX_TRANSACTIONS_PER_PAYLOAD]
-    withdrawals: List[Withdrawal, MAX_WITHDRAWALS_PER_PAYLOAD]  # [New in Capella]
+    # LikelyZeroGwei is like Gwei, except that its encoding optimizes for zero
+    # in that zero encodes to a single bit, while any other value starts with
+    # a one bit to be followed by the proper encoding of Gwei. The withdrawals list is as long
+    # as the transactions list above.
+    withdrawals: List[LikelyZeroGwei, MAX_TRANSACTIONS_PER_PAYLOAD]
 ```
 
 #### `ExecutionPayloadHeader`
@@ -340,49 +344,54 @@ def process_block(state: BeaconState, block: BeaconBlock) -> None:
     process_sync_aggregate(state, block.body.sync_aggregate)
 ```
 
-#### New `get_expected_withdrawals`
-
-```python
-def get_expected_withdrawals(state: BeaconState) -> Sequence[Withdrawal]:
-    epoch = get_current_epoch(state)
-    withdrawal_index = state.next_withdrawal_index
-    validator_index = state.next_withdrawal_validator_index
-    withdrawals: List[Withdrawal] = []
-    bound = min(len(state.validators), MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP)
-    for _ in range(bound):
-        validator = state.validators[validator_index]
-        balance = state.balances[validator_index]
-        if is_fully_withdrawable_validator(validator, balance, epoch):
-            withdrawals.append(Withdrawal(
-                index=withdrawal_index,
-                validator_index=validator_index,
-                address=ExecutionAddress(validator.withdrawal_credentials[12:]),
-                amount=balance,
-            ))
-            withdrawal_index += WithdrawalIndex(1)
-        elif is_partially_withdrawable_validator(validator, balance):
-            withdrawals.append(Withdrawal(
-                index=withdrawal_index,
-                validator_index=validator_index,
-                address=ExecutionAddress(validator.withdrawal_credentials[12:]),
-                amount=balance - MAX_EFFECTIVE_BALANCE,
-            ))
-            withdrawal_index += WithdrawalIndex(1)
-        if len(withdrawals) == MAX_WITHDRAWALS_PER_PAYLOAD:
-            break
-        validator_index = ValidatorIndex((validator_index + 1) % len(state.validators))
-    return withdrawals
-```
-
 #### New `process_withdrawals`
 
 ```python
-def process_withdrawals(state: BeaconState, payload: ExecutionPayload) -> None:
-    expected_withdrawals = get_expected_withdrawals(state)
-    assert payload.withdrawals == expected_withdrawals
+# Copied from process_effective_balanaces from phase0 with new lines marked.
 
-    for withdrawal in expected_withdrawals:
-        decrease_balance(state, withdrawal.validator_index, withdrawal.amount)
+def process_effective_balance_updates(state: BeaconState) -> None:
+    # NEW LINE: Get all balances that were swept
+    new_withdrawable_balances = {}
+
+    # Update effective balances with hysteresis
+    for index, validator in enumerate(state.validators):
+        eth1_creds = extract_eth1(validator.withdrawal_credentials)
+        balance = state.balances[index]
+        # NEW START
+        # If we find the eth1_creds in state.withdrawable_balances
+        # with a balance of 0, we know that it was swept. Clear the
+        # balance here as well.
+        if state.withdrawable_balances.get(eth1_creds, None) == 0:
+          if validator.withdrawal_credentials[:1] == ETH1_ADDRESS_WITHDRAWAL_PREFIX:
+             balance = min(balance, Eth(32))
+          elif validator.withdrawal_credentials[:1] == COMPOUNDING_WITHDRAWAL_PREFIX:
+             balance = min(balance, Eth(2048))
+        # NEW END
+        HYSTERESIS_INCREMENT = uint64(EFFECTIVE_BALANCE_INCREMENT // HYSTERESIS_QUOTIENT)
+        DOWNWARD_THRESHOLD = HYSTERESIS_INCREMENT * HYSTERESIS_DOWNWARD_MULTIPLIER
+        UPWARD_THRESHOLD = HYSTERESIS_INCREMENT * HYSTERESIS_UPWARD_MULTIPLIER
+        if (
+            balance + DOWNWARD_THRESHOLD < validator.effective_balance
+            or validator.effective_balance + UPWARD_THRESHOLD < balance
+        ):
+            validator.effective_balance = min(balance - balance % EFFECTIVE_BALANCE_INCREMENT, MAX_EFFECTIVE_BALANCE)
+        # NEW START
+        if validator.withdrawal_credentials[:1] == ETH1_ADDRESS_WITHDRAWAL_PREFIX and (sweepable := validator.balance - Eth(32)) > 0:
+           new_withdrawable_balance[eth1_creds] = sweepable
+        elif validator.withdrawal_credentials[:1] == COMPOUNDING_WITHDRAWAL_PREFIX and (sweepable := validator.balance - Eth(2048)) > 0:
+           new_withdrawable_balance[eth1_creds] = sweepable
+    state.withdrawable_balance = new_withdrawable_balance
+    # NEW END
+        
+def process_withdrawals(state: BeaconState, payload: ExecutionPayload) -> None:
+    expected_withdrawals = []
+    for tx, payload_balance in zip(payload.transactions, payload.withdrawals):
+      tx_sender = extract_tx_sender(tx)
+      if payload_balance != 0:
+        assert tx_sender in state.withdrawable_balance:
+        balance = state.withdrawable_balance[tx_sender]
+        assert balance != 0:
+        state.withdrawable_balance[tx_sender] = 0
 
     # Update the next withdrawal index if this block contained withdrawals
     if len(expected_withdrawals) != 0:
@@ -434,7 +443,7 @@ def process_execution_payload(state: BeaconState, body: BeaconBlockBody, executi
         base_fee_per_gas=payload.base_fee_per_gas,
         block_hash=payload.block_hash,
         transactions_root=hash_tree_root(payload.transactions),
-        withdrawals_root=hash_tree_root(payload.withdrawals),  # [New in Capella]
+        withdrawals_root=payload.withdrawals_root),  # [New in Capella]
     )
 ```
 
